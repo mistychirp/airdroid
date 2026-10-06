@@ -1,0 +1,5 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Starts (or restarts) the AirPlay receiver in the background, for manual use.
+# With the airplay_receiver module installed, the module does this for you.
+setsid nohup airplay-run > /dev/null 2>&1 < /dev/null &
+echo "AirPlay receiver starting (log: $HOME/shairport.log)"

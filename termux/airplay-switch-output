@@ -1,0 +1,19 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Moves playback to a fresh AAudio output after the output device changed (DAC
+# plugged in or out), without ending shairport-sync's AirPlay session.
+# Exits non-zero if PulseAudio doesn't cooperate; restart the receiver then.
+set -e
+
+p() { timeout 5 pactl "$@"; }
+
+new=aaudio_$(date +%s)
+old_modules=$(p list short modules | awk '$2 == "module-aaudio-sink" {print $1}')
+
+p load-module module-aaudio-sink sink_name="$new" no_close_hack=1 >/dev/null
+p set-default-sink "$new"
+for input in $(p list short sink-inputs | cut -f1); do
+  p move-sink-input "$input" "$new"
+done
+for module in $old_modules; do
+  p unload-module "$module"
+done

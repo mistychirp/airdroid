@@ -1,0 +1,1 @@
+-Wl,--wrap=pthread_create -Wl,--wrap=pthread_join -Wl,--wrap=pthread_detach -Wl,--wrap=pthread_cond_wait -Wl,--wrap=pthread_cond_timedwait -Wl,--wrap=read -Wl,--wrap=recv -Wl,--wrap=recvfrom -Wl,--wrap=accept -Wl,--wrap=select -Wl,--wrap=poll -Wl,--wrap=nanosleep -Wl,--wrap=usleep -Wl,--wrap=sleep

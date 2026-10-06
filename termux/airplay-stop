@@ -1,0 +1,6 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Stops the AirPlay receiver and PulseAudio. With the airplay_receiver module
+# enabled, the module starts it again; use its Action button instead.
+pkill -x shairport-sync
+pulseaudio --kill 2>/dev/null
+echo "AirPlay receiver stopped"

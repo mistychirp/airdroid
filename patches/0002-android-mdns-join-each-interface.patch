@@ -1,0 +1,77 @@
+diff --git a/tinysvcmdns.c b/tinysvcmdns.c
+index 210c91d..9f31550 100644
+--- a/tinysvcmdns.c
++++ b/tinysvcmdns.c
+@@ -1188,6 +1188,39 @@ struct mdns_service {
+ 
+ /////////////////////////////////
+ 
++#ifdef __ANDROID__
++#include <ifaddrs.h>
++#include <net/if.h>
++
++// Android has no default route when only the hotspot is up, so joining the
++// group "on any interface" fails with ENODEV and multicast sends have no route.
++// Join, and later send, on every IPv4 interface explicitly instead.
++#define MAX_MCAST_IFS 8
++static struct in_addr mcast_ifs[MAX_MCAST_IFS];
++static int mcast_if_count;
++
++static int join_on_each_interface(int sd, struct ip_mreq *mreq) {
++  struct ifaddrs *ifalist, *ifa;
++  if (getifaddrs(&ifalist) < 0)
++    return -1;
++  mcast_if_count = 0;
++  for (ifa = ifalist; ifa != NULL && mcast_if_count < MAX_MCAST_IFS; ifa = ifa->ifa_next) {
++    if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
++      continue;
++    if ((ifa->ifa_flags & IFF_LOOPBACK) || !(ifa->ifa_flags & IFF_UP) ||
++        !(ifa->ifa_flags & IFF_MULTICAST))
++      continue;
++    mreq->imr_interface = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
++    if (setsockopt(sd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *)mreq, sizeof(*mreq)) == 0)
++      mcast_ifs[mcast_if_count++] = mreq->imr_interface;
++    else
++      log_message(LOG_ERR, "recv setsockopt(IP_ADD_MEMBERSHIP) on %s: %m", ifa->ifa_name);
++  }
++  freeifaddrs(ifalist);
++  return mcast_if_count > 0 ? 0 : -1;
++}
++#endif
++
+ static int create_recv_sock() {
+   int sd = socket(AF_INET, SOCK_DGRAM, 0);
+   if (sd < 0) {
+@@ -1218,6 +1251,11 @@ static int create_recv_sock() {
+   memset(&mreq, 0, sizeof(struct ip_mreq));
+   mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+   mreq.imr_multiaddr.s_addr = inet_addr(MDNS_ADDR);
++#ifdef __ANDROID__
++  if (join_on_each_interface(sd, &mreq) == 0) {
++    r = 0;
++  } else
++#endif
+   if ((r = setsockopt(sd, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char *)&mreq, sizeof(mreq))) < 0) {
+     log_message(LOG_ERR, "recv setsockopt(IP_ADD_MEMBERSHIP): %m");
+     return r;
+@@ -1248,6 +1286,20 @@ static ssize_t send_packet(int fd, const void *data, size_t len) {
+     toaddr.sin_addr.s_addr = inet_addr(MDNS_ADDR);
+   }
+ 
++#ifdef __ANDROID__
++  if (mcast_if_count > 0) {
++    ssize_t sent = -1;
++    for (int i = 0; i < mcast_if_count; i++) {
++      if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &mcast_ifs[i], sizeof(mcast_ifs[i])) < 0)
++        continue;
++      ssize_t r = sendto(fd, data, len, 0, (struct sockaddr *)&toaddr, sizeof(struct sockaddr_in));
++      if (r >= 0)
++        sent = r;
++    }
++    return sent;
++  }
++#endif
++
+   return sendto(fd, data, len, 0, (struct sockaddr *)&toaddr, sizeof(struct sockaddr_in));
+ }
+ 
