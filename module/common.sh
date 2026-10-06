@@ -50,14 +50,33 @@ receiver_pid() {
   pidof shairport-sync
 }
 
-# RUN_COMMAND runs airplay-run inside the Termux app, where Android's audio
-# and DNS work and files get the right SELinux label. As a background task it
-# keeps Termux's foreground service up while the receiver runs.
-start_receiver() {
+# Runs one of the airplay-* scripts inside the Termux app through RUN_COMMAND.
+# Only there do Android's audio and DNS work, files get the right SELinux
+# label, and PulseAudio accepts pactl (it rejects it from `su`). A running
+# task also keeps Termux's foreground service up.
+run_in_termux() {
   am start-foreground-service --user 0 -n $TERMUX_PKG/com.termux.app.RunCommandService \
     -a com.termux.RUN_COMMAND \
-    --es com.termux.RUN_COMMAND_PATH $PREFIX/bin/airplay-run \
+    --es com.termux.RUN_COMMAND_PATH "$PREFIX/bin/$1" \
     --ez com.termux.RUN_COMMAND_BACKGROUND true > /dev/null 2>&1
+}
+
+start_receiver() {
+  run_in_termux airplay-run
+}
+
+# When PulseAudio last answered airplay-check (seconds since the epoch).
+last_health() {
+  cat $TERMUX/home/.airplay-health 2> /dev/null || echo 0
+}
+
+# What each PulseAudio thread is waiting on, to find out why it hung.
+# (debuggerd would give a backtrace, but it kills Termux's PulseAudio.)
+save_pulseaudio_threads() {
+  pa=$(pidof pulseaudio) || return
+  for task in /proc/"$pa"/task/*; do
+    echo "$(cat "$task/comm") state=$(cut -d' ' -f3 "$task/stat") wchan=$(cat "$task/wchan")"
+  done > $DATA/pulseaudio-hang.txt
 }
 
 stop_receiver() {
@@ -71,13 +90,6 @@ stop_receiver() {
   pkill -9 -x shairport-sync
   pkill -9 -x pulseaudio
   return 0
-}
-
-# Runs one of the Termux scripts as the Termux user but outside the app,
-# which is enough to talk to PulseAudio.
-as_termux() {
-  su "$(termux_uid)" -c "env HOME=$TERMUX/home PREFIX=$PREFIX TMPDIR=$PREFIX/tmp \
-    PATH=$PREFIX/bin LANG=en_US.UTF-8 $PREFIX/bin/bash $PREFIX/bin/$1"
 }
 
 # Android throttles Termux's processes when it isn't on screen, while the

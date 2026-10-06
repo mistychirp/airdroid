@@ -6,9 +6,13 @@ MODDIR=${0%/*}
 #    interface addresses only once, at startup),
 #  - moves playback to a fresh output when the DAC is plugged in or out,
 #  - restarts it when it dies, backing off if it keeps dying,
+#  - restarts it when PulseAudio dies or hangs (shairport-sync keeps running
+#    then, but nothing plays),
 #  - stops it when there's no network or the module is turned off.
 
 POLL=3
+HEALTH_EVERY=10 # polls between asking Termux to check PulseAudio (~30 s)
+HUNG_AFTER=60   # seconds without an answer before PulseAudio counts as hung
 
 until [ "$(getprop sys.boot_completed)" = 1 ]; do sleep 5; done
 until termux_ready; do sleep 10; done
@@ -41,6 +45,16 @@ next_start=0
 started_at=0
 quick_deaths=0
 boosted=
+polls=0
+
+# Adopt a receiver that's already running (the watcher itself was restarted)
+# instead of restarting it for a "network change" from nothing.
+if [ -n "$(receiver_pid)" ]; then
+  last_net=$(net_sig)
+  last_audio=$(audio_sig)
+  started_at=$(date +%s)
+  log "adopted the running receiver"
+fi
 
 while true; do
   now=$(date +%s)
@@ -89,9 +103,21 @@ while true; do
 
     else
       set_state on
+      polls=$((polls + 1))
+      [ $((polls % HEALTH_EVERY)) -eq 0 ] && run_in_termux airplay-check
+      answered=$(last_health)
+      [ "$answered" -lt "$started_at" ] && answered=$started_at
+
+      if [ -z "$(pidof pulseaudio)" ] && [ $((now - started_at)) -ge 10 ]; then
+        log "PulseAudio died: restarting"
+        restart
+      elif [ $((now - answered)) -ge $HUNG_AFTER ]; then
+        save_pulseaudio_threads
+        log "PulseAudio stopped answering (threads in pulseaudio-hang.txt): restarting"
+        restart
       # Act on a change once it has held for a poll, so a hotspot that's still
       # coming up doesn't cause two restarts.
-      if [ "$net" != "$last_net" ]; then
+      elif [ "$net" != "$last_net" ]; then
         if [ "$net" = "$pending_net" ]; then
           log "network changed ($last_net-> $net): restarting"
           restart
@@ -103,11 +129,9 @@ while true; do
         fi
       elif [ "$audio" != "$last_audio" ]; then
         if [ "$audio" = "$pending_audio" ]; then
+          # Runs in Termux and restarts the receiver itself if it fails.
           log "sound cards changed ($last_audio-> $audio): switching output"
-          if ! as_termux airplay-switch-output >> $LOG 2>&1; then
-            log "output switch failed: restarting"
-            restart
-          fi
+          run_in_termux airplay-switch-output
           last_audio=$audio
           pending_audio=
         else
