@@ -1,7 +1,0 @@
-#!/data/data/com.termux/files/usr/bin/bash
-# Records when PulseAudio last answered, for the airplay_receiver module. The
-# module runs this through RUN_COMMAND: PulseAudio only accepts pactl from
-# inside the Termux app.
-if timeout 5 pactl info > /dev/null 2>&1; then
-  date +%s > "$HOME/.airplay-health"
-fi

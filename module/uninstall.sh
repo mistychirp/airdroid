@@ -1,5 +1,4 @@
 pkill -x shairport-sync
-pkill -x pulseaudio
 
 # This runs early in boot, before the system services are up. Undo the battery
 # exemption (only if this module added it) once they are.

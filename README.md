@@ -36,8 +36,9 @@ Termux from GitHub or F-Droid (the Play Store build is outdated).
 
    This installs the build tools, builds the shim and runs its test, builds
    shairport-sync with the patches, and installs `airplay-run`,
-   `airplay-start`, `airplay-stop`, `airplay-switch-output` and
-   `~/.config/shairport-sync.conf`. An existing config is kept.
+   `airplay-start`, `airplay-stop` and `~/.config/shairport-sync.conf`. An
+   existing config is kept; one from the PulseAudio days is switched to the
+   AAudio output.
 
 2. Zip the module, install it, and reboot. Termux's home folder isn't visible
    to the KernelSU manager's file picker, so install it with `ksud` (Termux
@@ -60,8 +61,6 @@ A watcher checks the phone every 3 seconds:
   hotspot) and stops it when there isn't.
 - It restarts the receiver when the network changes, because the mDNS
   responder reads the phone's addresses only at startup.
-- When a USB DAC is plugged in or out, it moves playback to a fresh output
-  without ending the AirPlay session.
 - It restarts the receiver if it dies, backing off if it keeps dying.
 - It raises the receiver's priority, because Android throttles Termux when
   it isn't on screen.
@@ -71,7 +70,12 @@ module turns on `allow-external-apps` in Termux and makes Termux
 battery-unrestricted. The Action button in the KernelSU manager turns the
 receiver on and off. The watcher logs to `/data/adb/airplay_receiver/watcher.log`
 and the receiver to `~/shairport.log` in Termux (the previous run is in
-`~/shairport.log.1`).
+`~/shairport.log.1`). The receiver's log has sync and network statistics every
+few seconds: `Av Sync Error` and `All Sync PPM` near 0 and `Missing` at 0 mean
+clean playback, and underruns of the output are logged as they happen.
+
+Plugging a USB DAC in or out needs nothing from the module: Android moves the
+playing stream to the new output, and the session carries on.
 
 Without the module, run `airplay-start` and `airplay-stop` in Termux.
 
@@ -87,11 +91,18 @@ Without the module, run `airplay-start` and `airplay-stop` in Termux.
 - **mDNS on the hotspot** (`patches/0002`): with only the hotspot up there's
   no default route, so joining the mDNS group "on any interface" fails. The
   patch joins and sends on each interface.
-- **Audio output**: PulseAudio plays through Android's AAudio output. Its
-  timing is precise, while the OpenSL ES output's jitters by about 50 ms,
-  which makes shairport-sync correct constantly and crackle.
+- **Audio output** (`patches/0003`): an `aaudio` backend plays straight to
+  Android's AAudio from shairport-sync's player thread, with about 0.25 s
+  queued. Its delay comes from AAudio's presentation timestamps, which include
+  the DAC's own latency, so sync holds to a millisecond or two with no
+  corrections. It replaces PulseAudio, whose AAudio output ran Android's
+  low-latency path (a 2 ms callback waiting on PulseAudio's own thread, so any
+  hiccup crackled) and deadlocked when the output device changed. The output
+  is 32-bit, so the software volume control loses no resolution.
 - **No soxr**: Termux's libsoxr crashed during sync corrections and at exit,
-  so the build leaves it out and the config uses `basic` interpolation.
+  so the build leaves it out. The config uses `vernier` interpolation, which
+  stretches a packet by a frame when sync needs correcting; `basic` drops or
+  repeats a sample, which clicks, and a run of corrections sounds like sand.
 
 ## Limitations
 

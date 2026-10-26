@@ -1,8 +1,8 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# Runs the AirPlay receiver in the foreground: PulseAudio playing through
-# Android's AAudio output, then shairport-sync. The airplay_receiver module
-# starts this through Termux's RUN_COMMAND, which keeps the Termux app and its
-# foreground service alive for as long as the receiver runs.
+# Runs the AirPlay receiver (shairport-sync) in the foreground. The
+# airplay_receiver module starts this through Termux's RUN_COMMAND, which keeps
+# the Termux app and its foreground service alive for as long as the receiver
+# runs.
 
 CONF=$HOME/.config/shairport-sync.conf
 MAC_FILE=$HOME/.config/shairport-sync.mac
@@ -30,17 +30,5 @@ if pkill -x shairport-sync; then
   pkill -9 -x shairport-sync && sleep 0.5
 fi
 
-# Always start PulseAudio fresh: an AAudio output whose device went away is
-# dead and can hang PulseAudio.
-pulseaudio --kill 2>/dev/null
-pkill -9 -x pulseaudio
-sleep 1
-pulseaudio --start --exit-idle-time=-1 || exit 1
-
-# AAudio reports precise output timing, which keeps sync stable. no_close_hack
-# skips closing the stream on unload, which can crash on a dead stream.
-sink=aaudio_$(date +%s)
-pactl load-module module-aaudio-sink sink_name="$sink" no_close_hack=1 >/dev/null || exit 1
-pactl set-default-sink "$sink"
-
+echo "$(date '+%F %T') starting"
 SPS_DEVICE_MAC=$(cat "$MAC_FILE") exec shairport-sync -c "$CONF"

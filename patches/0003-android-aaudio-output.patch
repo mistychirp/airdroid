@@ -1,0 +1,481 @@
+diff --git a/Makefile.am b/Makefile.am
+index 96bf0cb..9a36fe1 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -120,6 +120,10 @@ if USE_SOUNDIO
+ shairport_sync_SOURCES += audio_soundio.c
+ endif
+ 
++if USE_AAUDIO
++shairport_sync_SOURCES += audio_aaudio.c
++endif
++
+ if USE_PULSEAUDIO
+ shairport_sync_SOURCES += audio_pa.c
+ endif
+diff --git a/audio.c b/audio.c
+index c1d2734..c646058 100644
+--- a/audio.c
++++ b/audio.c
+@@ -32,6 +32,9 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#ifdef CONFIG_AAUDIO
++extern audio_output audio_aaudio;
++#endif
+ #ifdef CONFIG_JACK
+ extern audio_output audio_jack;
+ #endif
+@@ -64,6 +67,9 @@ extern audio_output audio_stdout;
+ #endif
+ 
+ static audio_output *outputs[] = {
++#ifdef CONFIG_AAUDIO
++    &audio_aaudio,
++#endif
+ #ifdef CONFIG_ALSA
+     &audio_alsa,
+ #endif
+diff --git a/audio_aaudio.c b/audio_aaudio.c
+new file mode 100644
+index 0000000..08d6bbe
+--- /dev/null
++++ b/audio_aaudio.c
+@@ -0,0 +1,416 @@
++/*
++ * AAudio output driver for Android. This file is part of Shairport Sync.
++ *
++ * Writes to an AAudio stream from the player thread (blocking writes, no
++ * callback), so nothing else has to keep to the output's schedule. The delay
++ * comes from AAudio's presentation timestamps, which include the latency of
++ * the output device itself. When the output device changes (e.g. a USB DAC is
++ * plugged in or out), Android disconnects the stream; the next write opens a
++ * new one on the new default device and the session carries on.
++ *
++ * Copyright (c) 2026 misty
++ *
++ * Permission is hereby granted, free of charge, to any person
++ * obtaining a copy of this software and associated documentation
++ * files (the "Software"), to deal in the Software without
++ * restriction, including without limitation the rights to use,
++ * copy, modify, merge, publish, distribute, sublicense, and/or
++ * sell copies of the Software, and to permit persons to whom the
++ * Software is furnished to do so, subject to the following
++ * conditions:
++ *
++ * The above copyright notice and this permission notice shall be
++ * included in all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
++ * OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
++ * HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
++ * WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
++ * OTHER DEALINGS IN THE SOFTWARE.
++ */
++
++#include "audio.h"
++#include "common.h"
++#include <aaudio/AAudio.h>
++#include <android/api-level.h>
++#include <dlfcn.h>
++#include <errno.h>
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++// Termux builds for an Android version older than AAudio, so the functions
++// are looked up at run time instead of linked.
++static struct {
++  aaudio_result_t (*createStreamBuilder)(AAudioStreamBuilder **);
++  void (*setDirection)(AAudioStreamBuilder *, aaudio_direction_t);
++  void (*setPerformanceMode)(AAudioStreamBuilder *, aaudio_performance_mode_t);
++  void (*setUsage)(AAudioStreamBuilder *, aaudio_usage_t);
++  void (*setContentType)(AAudioStreamBuilder *, aaudio_content_type_t);
++  void (*setFormat)(AAudioStreamBuilder *, aaudio_format_t);
++  void (*setSampleRate)(AAudioStreamBuilder *, int32_t);
++  void (*setChannelCount)(AAudioStreamBuilder *, int32_t);
++  void (*setBufferCapacityInFrames)(AAudioStreamBuilder *, int32_t);
++  aaudio_result_t (*openStream)(AAudioStreamBuilder *, AAudioStream **);
++  aaudio_result_t (*deleteBuilder)(AAudioStreamBuilder *);
++  aaudio_result_t (*requestStart)(AAudioStream *);
++  aaudio_result_t (*close)(AAudioStream *);
++  aaudio_result_t (*write)(AAudioStream *, const void *, int32_t, int64_t);
++  aaudio_result_t (*getTimestamp)(AAudioStream *, clockid_t, int64_t *, int64_t *);
++  int64_t (*getFramesRead)(AAudioStream *);
++  int32_t (*getBufferCapacityInFrames)(AAudioStream *);
++  aaudio_result_t (*setBufferSizeInFrames)(AAudioStream *, int32_t);
++  int32_t (*getXRunCount)(AAudioStream *);
++  int32_t (*getDeviceId)(AAudioStream *);
++  int32_t (*getFramesPerBurst)(AAudioStream *);
++  const char *(*convertResultToText)(aaudio_result_t);
++} aa;
++
++typedef struct {
++  sps_format_t sps_format;
++  aaudio_format_t aaudio_format;
++  int bytes_per_sample;
++} aaudio_sps_t;
++
++// 32-bit output keeps the software volume control's resolution; it needs
++// Android 12. Android mixes in floating point either way.
++static aaudio_sps_t format_lookup[] = {{SPS_FORMAT_S32_LE, AAUDIO_FORMAT_PCM_I32, 4},
++                                       {SPS_FORMAT_S16_LE, AAUDIO_FORMAT_PCM_I16, 2}};
++
++static char channel_map_1[] = "FC";
++static char channel_map_2[] = "FL FR";
++
++// A write that can't get rid of anything for this long means the output is stuck.
++#define WRITE_TIMEOUT_NS 1000000000LL
++#define SILENCE_FRAMES 4096
++
++static pthread_mutex_t aaudio_mutex = PTHREAD_MUTEX_INITIALIZER;
++static AAudioStream *stream;
++static int32_t current_encoded_output_format;
++static aaudio_sps_t *current_format;
++static int rate, channels, frame_size;
++static void *silence;
++
++static int32_t buffer_frames;   // the stream's buffer once it's playing
++static int buffer_grown;        // the stream has its full buffer
++static int64_t frames_written;  // to this stream
++static int64_t frames_to_pad;   // silence owed to the next stream, see play()
++static int have_timestamp;      // last_position and last_time are valid
++static int64_t last_position, last_time;
++static int32_t xruns_reported;
++static int open_failures;
++
++static aaudio_sps_t *sps_format_lookup(sps_format_t to_find) {
++  unsigned int i;
++  for (i = 0; i < sizeof(format_lookup) / sizeof(aaudio_sps_t); i++)
++    if (format_lookup[i].sps_format == to_find)
++      return &format_lookup[i];
++  return NULL;
++}
++
++static int64_t monotonic_ns(void) {
++  struct timespec ts;
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return ts.tv_sec * 1000000000LL + ts.tv_nsec;
++}
++
++static const char *result_text(aaudio_result_t result) {
++  return aa.convertResultToText(result);
++}
++
++static int check_configuration(unsigned int in_channels, __attribute__((unused)) unsigned int in_rate,
++                               unsigned int in_format) {
++  // AAudio converts any rate to the device's; Android resamples well.
++  if ((in_channels < 1) || (in_channels > 2))
++    return EINVAL;
++  aaudio_sps_t *format_info = sps_format_lookup(in_format);
++  if (format_info == NULL)
++    return EINVAL;
++  if ((format_info->aaudio_format == AAUDIO_FORMAT_PCM_I32) && (android_get_device_api_level() < 31))
++    return EINVAL;
++  return 0;
++}
++
++static int32_t get_configuration(unsigned int in_channels, unsigned int in_rate,
++                                 unsigned int in_format) {
++  return search_for_suitable_configuration(in_channels, in_rate, in_format, &check_configuration);
++}
++
++// Frames written to the stream that haven't been heard yet. Call with the mutex held.
++static int64_t frames_queued(void) {
++  int64_t presented;
++  int64_t position, time_ns;
++  if (aa.getTimestamp(stream, CLOCK_MONOTONIC, &position, &time_ns) == AAUDIO_OK) {
++    last_position = position;
++    last_time = time_ns;
++    have_timestamp = 1;
++  }
++  if (have_timestamp) {
++    // the frame at last_position was (or will be) heard at last_time
++    presented = last_position + ((monotonic_ns() - last_time) * rate) / 1000000000;
++  } else {
++    // No timestamps until the output has started: count what it has taken.
++    presented = aa.getFramesRead(stream);
++  }
++  if (presented > frames_written) // ran dry
++    presented = frames_written;
++  if (presented < 0)
++    presented = 0;
++  return frames_written - presented;
++}
++
++// Call with the mutex held.
++static void close_stream(void) {
++  if (stream != NULL) {
++    int32_t xruns = aa.getXRunCount(stream);
++    if (xruns > xruns_reported)
++      inform("aaudio: %d underruns while closing the output.", xruns - xruns_reported);
++    aa.close(stream);
++    stream = NULL;
++  }
++  have_timestamp = 0;
++}
++
++// Call with the mutex held.
++static aaudio_result_t open_stream(void) {
++  AAudioStreamBuilder *builder;
++  aaudio_result_t result = aa.createStreamBuilder(&builder);
++  if (result != AAUDIO_OK)
++    return result;
++
++  // Room for the backend buffer the player keeps, plus some slack.
++  buffer_frames = (int32_t)((config.audio_backend_buffer_desired_length + 0.1) * rate);
++
++  aa.setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
++  // Not LOW_LATENCY: that gets an MMAP stream with 2 ms bursts.
++  aa.setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_NONE);
++  aa.setUsage(builder, AAUDIO_USAGE_MEDIA);
++  aa.setContentType(builder, AAUDIO_CONTENT_TYPE_MUSIC);
++  aa.setFormat(builder, current_format->aaudio_format);
++  aa.setSampleRate(builder, rate);
++  aa.setChannelCount(builder, channels);
++  aa.setBufferCapacityInFrames(builder, buffer_frames);
++  result = aa.openStream(builder, &stream);
++  aa.deleteBuilder(builder);
++  if (result != AAUDIO_OK) {
++    stream = NULL;
++    return result;
++  }
++
++  // A new track only starts playing once its buffer is full, and a session
++  // can start with less lead time than the full buffer holds. So start small
++  // and grow the buffer once the track is playing (see write_frames()).
++  aa.setBufferSizeInFrames(stream, rate / 20);
++  buffer_grown = 0;
++  frames_written = 0;
++  have_timestamp = 0;
++  xruns_reported = 0;
++
++  result = aa.requestStart(stream);
++  if (result != AAUDIO_OK) {
++    close_stream();
++    return result;
++  }
++  inform("aaudio: playing to output device %d (%s/%d, buffer %d frames).", aa.getDeviceId(stream),
++         short_format_description(current_encoded_output_format), rate,
++         aa.getBufferCapacityInFrames(stream));
++  return AAUDIO_OK;
++}
++
++// Writes all the frames, opening a stream if there isn't one and replacing a
++// disconnected one. Call with the mutex held.
++static int write_frames(const char *data, int64_t frames) {
++  int reopens = 0;
++  while (frames > 0) {
++    if (stream == NULL) {
++      aaudio_result_t result = open_stream();
++      if (result != AAUDIO_OK) {
++        if (open_failures++ % 100 == 0)
++          warn("aaudio: can't open an output: %s.", result_text(result));
++        return -EIO;
++      }
++      open_failures = 0;
++    }
++    int32_t chunk = frames > INT32_MAX ? INT32_MAX : (int32_t)frames;
++    aaudio_result_t result = aa.write(stream, data, chunk, WRITE_TIMEOUT_NS);
++    if (result > 0) {
++      frames_written += result;
++      data += (int64_t)result * frame_size;
++      frames -= result;
++      if ((buffer_grown == 0) && (aa.getFramesRead(stream) > 0)) {
++        aa.setBufferSizeInFrames(stream, buffer_frames);
++        buffer_grown = 1;
++      }
++    } else {
++      // What the old output still held is lost. Owe the new one that much
++      // silence, so playback continues on the same timeline.
++      frames_to_pad += frames_queued();
++      if (result == AAUDIO_ERROR_DISCONNECTED)
++        inform("aaudio: the output device changed, switching to the new one.");
++      else if (result == 0)
++        warn("aaudio: the output stopped taking audio, reopening it.");
++      else
++        warn("aaudio: write error: %s, reopening the output.", result_text(result));
++      close_stream();
++      if (++reopens > 3) // the output is unusable for now: drop these frames
++        return -EIO;
++    }
++  }
++  return 0;
++}
++
++static int play(void *buf, int samples, __attribute__((unused)) int sample_type,
++                __attribute__((unused)) uint32_t timestamp,
++                __attribute__((unused)) uint64_t playtime) {
++  int response = 0;
++  pthread_mutex_lock_and_cleanup_push(&aaudio_mutex);
++  if (current_format != NULL) {
++    while ((response == 0) && (frames_to_pad > 0)) {
++      int64_t frames = frames_to_pad > SILENCE_FRAMES ? SILENCE_FRAMES : frames_to_pad;
++      frames_to_pad -= frames;
++      response = write_frames(silence, frames);
++    }
++    if (response == 0)
++      response = write_frames(buf, samples);
++    if (stream != NULL) {
++      int32_t xruns = aa.getXRunCount(stream);
++      if (xruns > xruns_reported) {
++        inform("aaudio: output underrun (%d on this output so far).", xruns);
++        xruns_reported = xruns;
++      }
++    }
++  } else {
++    debug(1, "aaudio: play called before configure.");
++  }
++  pthread_cleanup_pop(1);
++  return response;
++}
++
++static int delay(long *the_delay) {
++  pthread_mutex_lock_and_cleanup_push(&aaudio_mutex);
++  if (stream != NULL)
++    *the_delay = frames_queued() + frames_to_pad;
++  else
++    *the_delay = frames_to_pad;
++  pthread_cleanup_pop(1);
++  return 0;
++}
++
++static void flush(void) {
++  // Closing also lets the output device go idle while nothing is playing.
++  pthread_mutex_lock_and_cleanup_push(&aaudio_mutex);
++  close_stream();
++  frames_to_pad = 0;
++  pthread_cleanup_pop(1);
++}
++
++static void stop(void) { flush(); }
++
++static int configure(int32_t requested_encoded_format, char **channel_map) {
++  int response = 0;
++  pthread_mutex_lock_and_cleanup_push(&aaudio_mutex);
++  if (current_encoded_output_format != requested_encoded_format) {
++    aaudio_sps_t *format_info = sps_format_lookup(FORMAT_FROM_ENCODED_FORMAT(requested_encoded_format));
++    if (format_info == NULL) {
++      debug(1, "aaudio: can't configure %s.", short_format_description(requested_encoded_format));
++      response = EINVAL;
++    } else {
++      debug(2, "aaudio: output configuration %s.",
++            short_format_description(requested_encoded_format));
++      close_stream(); // the next write opens one with the new configuration
++      frames_to_pad = 0;
++      current_encoded_output_format = requested_encoded_format;
++      current_format = format_info;
++      rate = RATE_FROM_ENCODED_FORMAT(requested_encoded_format);
++      channels = CHANNELS_FROM_ENCODED_FORMAT(requested_encoded_format);
++      frame_size = channels * format_info->bytes_per_sample;
++      free(silence);
++      silence = calloc(SILENCE_FRAMES, frame_size);
++      if (silence == NULL)
++        die("aaudio: can't allocate a silence buffer.");
++    }
++  }
++  if ((response == 0) && (channel_map != NULL))
++    *channel_map = channels == 1 ? channel_map_1 : channel_map_2;
++  pthread_cleanup_pop(1);
++  return response;
++}
++
++static void *resolve(void *lib, const char *name) {
++  void *symbol = dlsym(lib, name);
++  if (symbol == NULL)
++    die("aaudio: libaaudio.so has no %s.", name);
++  return symbol;
++}
++
++static int init(__attribute__((unused)) int argc, __attribute__((unused)) char **argv) {
++  config.audio_backend_buffer_desired_length = 0.25;
++  config.audio_backend_buffer_interpolation_threshold_in_seconds = 0.02;
++  config.audio_backend_latency_offset = 0;
++
++#ifdef CONFIG_FFMPEG
++  parse_audio_options("aaudio", SPS_FORMAT_SET, SPS_RATE_SET, SPS_CHANNEL_SET);
++#else
++  parse_audio_options("aaudio", SPS_FORMAT_NON_FFMPEG_SET, SPS_RATE_NON_FFMPEG_SET,
++                      SPS_CHANNNEL_NON_FFMPEG_SET);
++#endif
++
++  void *lib = dlopen("libaaudio.so", RTLD_NOW);
++  if (lib == NULL)
++    die("aaudio: can't load libaaudio.so: %s.", dlerror());
++  aa.createStreamBuilder = resolve(lib, "AAudio_createStreamBuilder");
++  aa.setDirection = resolve(lib, "AAudioStreamBuilder_setDirection");
++  aa.setPerformanceMode = resolve(lib, "AAudioStreamBuilder_setPerformanceMode");
++  aa.setUsage = resolve(lib, "AAudioStreamBuilder_setUsage");
++  aa.setContentType = resolve(lib, "AAudioStreamBuilder_setContentType");
++  aa.setFormat = resolve(lib, "AAudioStreamBuilder_setFormat");
++  aa.setSampleRate = resolve(lib, "AAudioStreamBuilder_setSampleRate");
++  aa.setChannelCount = resolve(lib, "AAudioStreamBuilder_setChannelCount");
++  aa.setBufferCapacityInFrames = resolve(lib, "AAudioStreamBuilder_setBufferCapacityInFrames");
++  aa.openStream = resolve(lib, "AAudioStreamBuilder_openStream");
++  aa.deleteBuilder = resolve(lib, "AAudioStreamBuilder_delete");
++  aa.requestStart = resolve(lib, "AAudioStream_requestStart");
++  aa.close = resolve(lib, "AAudioStream_close");
++  aa.write = resolve(lib, "AAudioStream_write");
++  aa.getTimestamp = resolve(lib, "AAudioStream_getTimestamp");
++  aa.getFramesRead = resolve(lib, "AAudioStream_getFramesRead");
++  aa.getBufferCapacityInFrames = resolve(lib, "AAudioStream_getBufferCapacityInFrames");
++  aa.setBufferSizeInFrames = resolve(lib, "AAudioStream_setBufferSizeInFrames");
++  aa.getXRunCount = resolve(lib, "AAudioStream_getXRunCount");
++  aa.getDeviceId = resolve(lib, "AAudioStream_getDeviceId");
++  aa.getFramesPerBurst = resolve(lib, "AAudioStream_getFramesPerBurst");
++  aa.convertResultToText = resolve(lib, "AAudio_convertResultToText");
++
++  stream = NULL;
++  current_encoded_output_format = 0;
++  current_format = NULL;
++  return 0;
++}
++
++static void deinit(void) {
++  pthread_mutex_lock_and_cleanup_push(&aaudio_mutex);
++  close_stream();
++  pthread_cleanup_pop(1);
++}
++
++audio_output audio_aaudio = {.name = "aaudio",
++                             .help = NULL,
++                             .init = &init,
++                             .deinit = &deinit,
++                             .prepare = NULL,
++                             .get_configuration = &get_configuration,
++                             .configure = &configure,
++                             .start = NULL,
++                             .play = &play,
++                             .stop = &stop,
++                             .is_running = NULL,
++                             .flush = &flush,
++                             .delay = &delay,
++                             .stats = NULL,
++                             .volume = NULL,
++                             .parameters = NULL,
++                             .mute = NULL};
+diff --git a/configure.ac b/configure.ac
+index 4087ea6..14c0ece 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -306,6 +306,15 @@ if test "x$with_soundio" = "xyes" ; then
+ fi
+ AM_CONDITIONAL([USE_SOUNDIO], [test "x$with_soundio" = "xyes"])
+ 
++# Look for aaudio flag
++AC_ARG_WITH(aaudio, [AS_HELP_STRING([--with-aaudio],[build the Android AAudio backend into Shairport Sync])])
++if test "x$with_aaudio" = "xyes" ; then
++  AC_DEFINE([CONFIG_AAUDIO], 1, [Include the Android AAudio backend.])
++  AC_CHECK_HEADER([aaudio/AAudio.h], , AC_MSG_ERROR(AAudio support requires the Android NDK headers))
++  AC_CHECK_LIB([dl], [dlopen])
++fi
++AM_CONDITIONAL([USE_AAUDIO], [test "x$with_aaudio" = "xyes"])
++
+ # Look for pulseaudio flag
+ AC_ARG_WITH(pulseaudio, [AS_HELP_STRING([--with-pulseaudio],[build the PulseAudio backend into Shairport Sync])])
+ if test "x$with_pulseaudio" = "xyes" ; then
